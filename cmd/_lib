@@ -17,7 +17,6 @@ function get_ip() {
     fi
 }
 
-
 function requires_command() {
     local cmd="$1"
     local message="$2"

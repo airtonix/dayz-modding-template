@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # vim: set filetype=bash:
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,6 +9,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 SERVER_DIR="$PROJECT_DIR/server"
 CONFIG_FILE="$PROJECT_DIR/config/mods.json"
 WORKSHOP_ID=221100
+DAYZ_MOD_P_DRIVE="${DAYZ_MOD_P_DRIVE:-/Dayz_P_Drive}"
 
 STEAMCMD_CMD=""
 
@@ -21,7 +22,9 @@ Commands:
     new NAME                        - Scaffold a new local mod from template
     build NAME                      - Build local mod into PBO using depbo-tools
     workbench NAME                  - Launch Workbench for a local mod
+    setup_workdrive [DRIVE]         - Setup symlinks for Workbench (default: P:/)
     status                          - Show configured and installed mods
+    client-check                    - Check which mods are installed on client
     search QUERY                    - Search for mods (fuzzy match)
     enable ID NAME                  - Enable a mod (add to config)
     disable NAME                    - Disable a mod (remove from config)
@@ -33,6 +36,8 @@ Examples:
     $0 new mymod
     $0 build mymod
     $0 workbench mymod
+    $0 setup_workdrive
+    $0 setup_workdrive /mnt/p
     $0 status
     $0 search expansion
     $0 enable 1559212036 '@cf'
@@ -132,6 +137,24 @@ status_mods() {
     echo "Total: $mod_count mod(s)"
 }
 
+scrape_workshop_page() {
+    local search_url
+    local html
+    local query
+
+    query="$1"
+    search_url="https://steamcommunity.com/workshop/browse/?appid=$WORKSHOP_ID&searchtext=$(echo "$query" | sed 's/ /%20/g')&numperpage=50"
+    html=$(curl -s -A "Mozilla/5.0" "$search_url" 2>/dev/null)
+
+    if [ -z "$html" ]; then
+        echo "[!] Failed to fetch search results"
+        echo "[*] Visit Steam Workshop: $search_url"
+        return 1
+    fi
+
+    echo "$html"
+}
+
 search_mods() {
     local query="$@"
 
@@ -148,17 +171,7 @@ search_mods() {
     echo "[*] Querying Steam Workshop..."
     echo ""
 
-    local search_url="https://steamcommunity.com/workshop/browse/?appid=$WORKSHOP_ID&searchtext=$(echo "$query" | sed 's/ /%20/g')&numperpage=30"
-
-    local html=$(curl -s -A "Mozilla/5.0" "$search_url" 2>/dev/null)
-
-    if [ -z "$html" ]; then
-        echo "[!] Failed to fetch search results"
-        echo "[*] Visit Steam Workshop: $search_url"
-        return 1
-    fi
-
-    local mod_ids=$(echo "$html" | grep -oP '/sharedfiles/filedetails/\?id=\K\d+' | head -10)
+    local mod_ids=$(echo "$(scrape_workshop_page "$query")" | grep -oP '/sharedfiles/filedetails/\?id=\K\d+' | head -10 | uniq)
 
     if [ -z "$mod_ids" ]; then
         echo "[*] No mods found for '$query'"
@@ -192,47 +205,23 @@ search_mods() {
         return 0
     fi
 
-    local response_file=$(mktemp)
-    echo "$response" > "$response_file"
-
-    search_mods_simple "$response_file"
-
-    rm -f "$response_file"
-}
-
-search_mods_simple() {
-    local response_file=$1
 
     echo "Found mods:"
     echo ""
 
-    local index=1
-    cat "$response_file" | jq -r '.response.publishedfiledetails[] |
+    template="""
+    Title: {title}
+    ID: {id}
+    Subscriptions: {subs}
+    """
+
+    echo "$response" | jq -r '.response.publishedfiledetails[] |
         select(.result == 1 and .publishedfileid != null and .publishedfileid != "") |
-        .title as $title |
-        .publishedfileid as $id |
-        .subscriptions as $subs |
-        "TITLE:\($title|gsub("-"; " ")|gsub("  "; " "))|ID:\($id)|SUBS:\($subs)"' 2>/dev/null | \
-    awk '!seen[$0]++' | \
-    while IFS='|' read -r title_part id_part subs_part; do
-        local title=$(echo "$title_part" | sed 's/^TITLE://')
-        local mod_id=$(echo "$id_part" | sed 's/^ID://')
-        local subs=$(echo "$subs_part" | sed 's/^SUBS://')
-
-        if [ -n "$title" ] && [ -n "$mod_id" ]; then
-            if [ ${#title} -gt 45 ]; then
-                title="${title:0:42}..."
-            fi
-
-            echo "$index. $title"
-            echo "   ID: $mod_id"
-            echo "   Subscribers: $subs"
-            echo "   Enable: ./cmd/mods enable $mod_id @modname"
-            echo ""
-
-            ((index++))
-        fi
-    done
+        " [\(.publishedfileid)] \(.title|gsub("-"; " ")|gsub("  "; " "))\n" +
+        "   created: \(.time_created | strftime("%Y-%m-%d %H:%M:%S"))\n" +
+        "   updated: \(.time_updated | strftime("%Y-%m-%d %H:%M:%S"))\n" +
+        " \n"
+    '
 }
 
 
@@ -460,12 +449,14 @@ new_mod() {
     echo "[*] Creating script folders..."
 
     mkdir -p "$mod_dir/$template_token/Scripts/1_Core/$mod_prefix"
+    mkdir -p "$mod_dir/$template_token/Scripts/2_GameLib/$mod_prefix"
     mkdir -p "$mod_dir/$template_token/Scripts/3_Game/$mod_prefix"
     mkdir -p "$mod_dir/$template_token/Scripts/4_World/$mod_prefix"
     mkdir -p "$mod_dir/$template_token/Scripts/5_Mission/$mod_prefix"
 
     echo "[*] Adding guides..."
     echo "# Core" > "$mod_dir/$template_token/Scripts/1_Core/$mod_prefix/README.md"
+    echo "# GameLib" > "$mod_dir/$template_token/Scripts/2_GameLib/$mod_prefix/README.md"
     echo "# Game" > "$mod_dir/$template_token/Scripts/3_Game/$mod_prefix/README.md"
     echo "# World" > "$mod_dir/$template_token/Scripts/4_World/$mod_prefix/README.md"
     echo "# Mission" > "$mod_dir/$template_token/Scripts/5_Mission/$mod_prefix/README.md"
@@ -505,7 +496,46 @@ new_mod() {
     echo "  2. Edit $mod_dir/mod.cpp"
     echo "  3. Add scripts to $mod_dir/Scripts/"
     echo "  4. Configure as needed in $mod_dir/config/"
-  }
+}
+
+# We can only setup a workdrive for one mod at a time.
+setup_workdrive() {
+    local mod_name
+
+    mod_name=$1
+    drive_path="${2:-$DAYZ_MOD_P_DRIVE}"
+    echo "[*] Setting up Workdrive symlinks..."
+    echo "[*] Drive path: $drive_path"
+
+    local mod_folder_name
+    local junction_path
+
+    for dir in "$PROJECT_DIR/pkgs/$mod_name/"*; do
+        if [ -d "$dir/Workbench" ] && [ -f "$dir/Workbench/dayz.gproj" ]; then
+            mod_folder_name=$(basename "$dir")
+            junction_path="$drive_path/$mod_folder_name"
+            echo "[*] Creating symlink for '$mod_folder_name' to '$junction_path'"
+            ln -s "$dir" "$junction_path"
+        fi
+    done
+
+    # for /d %%d in (Dependencies/*) do (
+    #     echo Creating junction for "%%d" to "%drive%/%%d"
+    #     mklink /j "%drive%/%%d" "%cd%/Dependencies/%%d"
+    # )
+    for dir in "$PROJECT_DIR/pkgs/$mod_name/Dependencies/"*; do
+        if [ -d "$dir" ]; then
+            mod_folder_name=$(basename "$dir")
+            junction_path="$drive_path/$mod_folder_name"
+            echo "[*] Creating symlink for dependency '$mod_folder_name' to '$junction_path'"
+            ln -s "$dir" "$junction_path"
+        fi
+    done
+
+    echo "[+] Workdrive setup complete!"
+    echo "[*] To use, map drive %drive% to P: in Workbench."
+    echo "[*] Example: subst P: %drive%"
+}
 
 build_mod() {
     local mod_name=$1
@@ -604,8 +634,40 @@ launch_workbench() {
 
       echo "[*] Launching Workbench for mod: $mod_name"
 
-      "$STEAMCMD_CMD" +@NoPromptForPassword 1 +run_app_build_app "$dayz_tools_appid" -doLogs -profiles="$profiles_dir" -repository="$mod_dir" +quit
+      "$STEAMCMD_CMD" +@NoPromptForPassword 1 +app_run "$dayz_tools_appid" -doLogs -profiles="$profiles_dir" -repository="$mod_dir" +quit
   }
+
+client_check() {
+    check_jq
+
+    check_config_exists || return 0
+
+    echo "========================================"
+    echo "Client Mod Status Check"
+    echo "========================================"
+    echo ""
+
+    local STEAM_WORKSHOP_DIR=".steam/steam/steamapps/workshop/content/$WORKSHOP_ID"
+    local steam_workshop="$HOME/$STEAM_WORKSHOP_DIR"
+
+    echo "Checking mods in Steam Workshop directory:"
+    echo "  ~/$STEAM_WORKSHOP_DIR"
+    echo ""
+
+    jq -r '.mods[] | "\(.name)[\(.id)]"' "$CONFIG_FILE" | while read mod_info; do
+        local mod_id=$(echo "$mod_info" | grep -oP '\[\K[0-9]+(?=\])')
+        local mod_path="$steam_workshop/$mod_id"
+
+        if [ -d "$mod_path" ]; then
+            local file_count=$(find "$mod_path" -type f | wc -l)
+            echo "$mod_info ✓ - $file_count"
+        else
+            echo "$mod_info ✗ - 0"
+        fi
+    done
+
+    echo ""
+}
 
 main() {
      if [ $# -eq 0 ]; then
@@ -613,43 +675,46 @@ main() {
          exit 0
      fi
 
-      case "$1" in
-          new)
-              new_mod "$2"
-              ;;
-          build)
-              build_mod "$2"
-              ;;
-          workbench)
-              launch_workbench "$2"
-              ;;
-           status)
-               status_mods
+       case "$1" in
+           new)
+               new_mod "$2"
                ;;
-           search)
-               search_mods "${@:2}"
+           build)
+               build_mod "$2"
                ;;
-           enable)
-               enable_mod "$2" "$3"
+           workbench)
+               launch_workbench "$2"
                ;;
-           disable)
-               disable_mod "$2"
+            status)
+                status_mods
+                ;;
+            client-check)
+                client_check
+                ;;
+            search)
+                search_mods "${@:2}"
+                ;;
+            enable)
+                enable_mod "$2" "$3"
+                ;;
+            disable)
+                disable_mod "$2"
+                ;;
+           install)
+               install_mods
                ;;
-          install)
-              install_mods
-              ;;
-          update)
-              update_mods
-              ;;
-          help|--help|-h)
-              print_usage
-              ;;
-          *)
-              echo "[!] Unknown command: $1"
-              print_usage
-              exit 1
-              ;;
-      esac
+           update)
+               update_mods
+               ;;
+           help|--help|-h)
+               print_usage
+               ;;
+           *)
+               echo "[!] Unknown command: $1"
+               print_usage
+               exit 1
+               ;;
+       esac
 }
 
 main "$@"
